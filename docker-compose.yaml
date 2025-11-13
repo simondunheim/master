@@ -1,0 +1,95 @@
+version: '3.8'
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.backend
+    container_name: berlin-insar-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persistent data storage with proper permissions
+      - ./data:/app/data_berlin_A:rw
+      - ./results:/app/results:rw
+      - ./processing:/app/processing:rw
+      # NEW: Add persistent storage for actual results in /app
+      - ./app_results:/app/app_results:rw
+      # Keep work directory persistent for resume capability
+      #- ./work:/app/raw_berlin_A:rw
+      # Mount DEM cache
+      - ./dem_cache:/app/dem_cache:rw
+      - ./backend/config.txt:/app/config.txt:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYGMTSAR_SCHEDULER=synchronous
+      - OMP_NUM_THREADS=4
+      - DASK_DISTRIBUTED__WORKER__DAEMON=False
+      # CORS and networking environment variables
+      - CORS_ORIGINS=*
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+    networks:
+      - insar-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # Add user mapping to fix permissions
+    user: "1000:1000"
+    # Resource limits to prevent system crashes
+    deploy:
+      resources:
+        limits:
+          memory: 12G # Maximum 12GB RAM
+          cpus: '4.0' # Maximum 4 CPU cores
+        reservations:
+          memory: 4G # Reserve minimum 4GB RAM
+          cpus: '2.0' # Reserve minimum 2 CPU cores
+    # Shared memory size for processing
+    shm_size: 2G
+    
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: berlin-insar-frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      # Mount source code for hot reload during development
+      - ./frontend:/app:rw
+      - /app/node_modules # Prevent overwriting node_modules
+    environment:
+      - NODE_ENV=development
+      - VITE_API_BASE_URL=http://localhost:8000
+      # Enable CORS for Vite dev server
+      - VITE_CORS_ENABLED=true
+    networks:
+      - insar-network
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    # Light resource limits for frontend
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+    # Add extra hosts for better networking
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+networks:
+  insar-network:
+    driver: bridge
+    # Enable IPv6 and configure network for better connectivity
+    enable_ipv6: false
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.20.0.0/16
+          gateway: 172.20.0.1

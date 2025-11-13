@@ -1,0 +1,130 @@
+# Base image: plain Ubuntu
+FROM ubuntu:22.04
+
+# Set environment variables
+ARG DEBIAN_FRONTEND=noninteractive
+ARG GMTSAR=/usr/local/GMTSAR
+ARG ORBITS=/usr/local/orbits
+ENV PATH=${GMTSAR}/bin:$PATH
+
+# Create user
+ARG USERNAME=developer
+ARG USER_UID=1000
+ARG USER_GID=$USER_UID
+
+# System packages and Python setup
+RUN apt-get update && apt-get install -y \
+    sudo \
+    git \
+    curl \
+    wget \
+    python3 \
+    python3-pip \
+    python3-dev \
+    build-essential \
+    gfortran \
+    make \
+    autoconf \
+    subversion \
+    csh \
+    gdal-bin \
+    libgdal-dev \
+    libtiff5-dev \
+    libhdf5-dev \
+    liblapack-dev \
+    libgmt-dev \
+    gmt \
+    zip \
+    htop \
+    mc \
+    netcdf-bin \
+    xvfb \
+    libegl1-mesa \
+    jq \
+    pkg-config \
+    libproj-dev \
+    libgeos-dev \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user
+RUN groupadd --gid $USER_GID $USERNAME \
+    && useradd --uid $USER_UID --gid $USER_GID -m $USERNAME \
+    && echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# Install GMTSAR
+RUN cd $(dirname ${GMTSAR}) \
+    && git config --global advice.detachedHead false \
+    && git clone --branch master https://github.com/gmtsar/gmtsar GMTSAR \
+    && cd ${GMTSAR} \
+    && git checkout e98ebc0f4164939a4780b1534bac186924d7c998 \
+    && autoconf \
+    && ./configure --with-orbits-dir=${ORBITS} CFLAGS='-z muldefs' LDFLAGS='-z muldefs' \
+    && make \
+    && make install
+
+# Install Python dependencies in specific order
+RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel
+
+# Install numpy first
+RUN pip3 install --no-cache-dir numpy==1.26.4
+
+# Install core scientific packages
+RUN pip3 install --no-cache-dir \
+    pandas==2.1.4 \
+    xarray==2023.12.0 \
+    scipy==1.11.4
+
+# Install geospatial packages - MATCH WORKING COLAB VERSIONS
+RUN pip3 install --no-cache-dir \
+    rasterio==1.3.11 \
+    geopandas==1.0.1 \
+    shapely==2.0.2 \
+    pyproj==3.6.1 \
+    fiona==1.9.6
+
+# Install other dependencies
+RUN pip3 install --no-cache-dir \
+    asf_search==7.0.4 \
+    h5netcdf==1.3.0 \
+    h5py==3.10.0 \
+    matplotlib \
+    dask[complete] \
+    distributed
+
+# Install pygmtsar - should match working version
+RUN pip3 install --no-cache-dir pygmtsar
+
+# Install FastAPI and web server dependencies
+RUN pip3 install --no-cache-dir \
+    fastapi==0.104.1 \
+    uvicorn[standard]==0.24.0 \
+    python-multipart==0.0.6 \
+    aiofiles==23.2.1 \
+    Pillow==10.0.1
+
+# Set environment variables for compatibility
+ENV PYGMTSAR_SCHEDULER=synchronous
+ENV OMP_NUM_THREADS=4
+ENV DASK_DISTRIBUTED__WORKER__DAEMON=False
+ENV PYTHONPATH=/usr/local/lib/python3.10/site-packages:$PYTHONPATH
+
+# Create data directories and set permissions
+RUN mkdir -p /app/results /app/data /app/work /app/processing \
+    && chown -R $USERNAME:$USERNAME /app
+
+# Set working directory
+WORKDIR /app
+
+# Copy application files
+COPY main.py /app/
+COPY berlin_insar.py /app/
+RUN chown $USERNAME:$USERNAME /app/main.py /app/berlin_insar.py
+
+# Switch to non-root user
+USER $USERNAME
+
+# Expose FastAPI port
+EXPOSE 8000
+
+# Run FastAPI server instead of the processing script directly
+CMD ["python3", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

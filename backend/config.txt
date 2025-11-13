@@ -1,0 +1,2 @@
+EARTHDATA_USERNAME=simonericmoon49
+EARTHDATA_PASSWORD=Simon4998Korfmacher?
