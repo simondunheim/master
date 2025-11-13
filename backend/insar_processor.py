@@ -23,7 +23,6 @@ import xarray as xr
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configure matplotlib for non-interactive backend
 plt.switch_backend('Agg')
 plt.rcParams['figure.figsize'] = [12, 8]
 plt.rcParams['figure.dpi'] = 100
@@ -45,14 +44,11 @@ class InSARProcessor:
         self.results_dir = Path("/app/insar_results")
         self.download_dir = self.results_dir  # For compatibility with main.py
         
-        # Create directories
         for directory in [self.data_dir, self.processing_dir, self.results_dir]:
             directory.mkdir(exist_ok=True, parents=True)
         
-        # Job status tracking
         self.job_statuses = {}
         
-        # Initialize Dask client for distributed processing
         self.client = None
         self._init_dask_client()
     
@@ -66,7 +62,6 @@ class InSARProcessor:
                 except:
                     pass
             
-            # Optimized Dask configuration for container environment
             self.client = Client(
                 processes=False,  # Use threads instead of processes
                 threads_per_worker=2,
@@ -76,7 +71,6 @@ class InSARProcessor:
                 dashboard_address=None,  # Disable dashboard to save memory
             )
             
-            # Configure Dask for better memory management
             import dask
             dask.config.set({
                 'distributed.worker.memory.target': 0.5,  # Start spilling at 50% (reduced from 60%)
@@ -161,13 +155,10 @@ class InSARProcessor:
             # Determine reference date
             reference_date = parameters.get('referenceDate')
             if not reference_date:
-                # Auto-select reference date (middle of time series)
-                # The scenes DataFrame has 'datetime' column and date index
                 
                 if 'datetime' in scenes.columns:
                     # Use the datetime column
                     datetimes = scenes['datetime'].unique()
-                    # Convert datetime objects to date strings
                     dates = []
                     for dt in datetimes:
                         if hasattr(dt, 'strftime'):
@@ -184,13 +175,11 @@ class InSARProcessor:
                     logger.info(f"Auto-selected reference date from datetime column: {reference_date}")
                     
                 elif hasattr(scenes.index, 'name') and scenes.index.name == 'date':
-                    # Use the date index directly
                     dates = sorted(scenes.index.unique().tolist())
                     reference_date = dates[len(dates) // 2]
                     logger.info(f"Auto-selected reference date from index: {reference_date}")
                     
                 else:
-                    # Fallback: Let PyGMTSAR auto-select by not setting a reference
                     reference_date = None
                     logger.info("No reference date specified, letting PyGMTSAR auto-select")
             
@@ -204,7 +193,6 @@ class InSARProcessor:
             
             sbas = Stack(workdir, drop_if_exists=True).set_scenes(scenes)
             
-            # Set reference date if specified, otherwise let PyGMTSAR auto-select reference scene 
             if reference_date:
                 sbas = sbas.set_reference(reference_date)
                 logger.info(f"Set reference date to: {reference_date}")
@@ -213,7 +201,6 @@ class InSARProcessor:
             
             logger.info(f"Initialized stack with {len(sbas.to_dataframe())} scenes")
             
-            # Log the actual reference that was selected
             actual_reference = sbas.reference if hasattr(sbas, 'reference') else "Unknown"
             logger.info(f"Actual reference date used: {actual_reference}")
             
@@ -272,8 +259,6 @@ class InSARProcessor:
             self.update_status(job_id, "processing", "Computing persistent scatterers", 70)
             self._log_memory_usage("before PSF computation")
             
-            # Compute Persistent Scatterers Function (PSF) 
-            # This is the most memory-intensive step
             logger.info("Starting PSF computation (memory-intensive)")
             sbas.compute_ps()
             
@@ -290,12 +275,9 @@ class InSARProcessor:
             
             logger.info("Starting multi-look interferogram computation")
             
-            # Compute multi-look interferograms with 30m resolution
-            # This creates the foundation for displacement analysis
             interferogram_dir = 'intf_mlook'
             wavelength = 30  # 30 meter resolution
             
-            # Use PSF as weights to emphasize stable pixels
             weight = psfunction
             
             sbas.compute_interferogram_multilook(
@@ -325,9 +307,6 @@ class InSARProcessor:
             
             logger.info("Starting SNAPHU 2D spatial unwrapping")
             
-            # Unwrap the interferograms using SNAPHU
-            # This converts wrapped phase (-π to π) to continuous unwrapped phase
-            # This is critical for measuring actual ground displacement
             unwrap_sbas = sbas.unwrap_snaphu(intf_sbas, corr_sbas)
             
             logger.info("SNAPHU unwrapping completed")
@@ -350,20 +329,14 @@ class InSARProcessor:
             
             logger.info("Starting trend correction computation")
             
-            # Compute trend correction to remove systematic errors
-            # Use limited set of fitting variables to avoid overfitting for small areas
             decimator_resolution = parameters.get('trend_decimator_resolution', 15)
             decimator = sbas.decimator(resolution=decimator_resolution, grid=(1,1))
             
-            # Get topography and incidence angle for trend modeling
             topo_decimated = decimator(sbas.get_topo())
             inc_decimated = decimator(sbas.incidence_angle())
             
-            # Create coordinate grids for spatial trend modeling
             yy, xx = xr.broadcast(topo_decimated.y, topo_decimated.x)
             
-            # Perform multivariate regression to detect trends
-            # This removes orbital errors, ionospheric delays, stratified atmospheric effects, etc.
             trend_variables = [
                 topo_decimated,              # Topographic contribution
                 topo_decimated * yy,         # Topography-latitude interaction
@@ -382,7 +355,6 @@ class InSARProcessor:
             logger.info("Trend correction computation completed")
             logger.info(f"Trend correction shape: {trend_sbas.shape}")
             
-            # Force cleanup after trend correction
             gc.collect()
             self._log_memory_usage("after trend correction")
             
@@ -402,13 +374,11 @@ class InSARProcessor:
             
             logger.info(f"Quality filtering: {len(baseline_pairs)} -> {len(baseline_pairs_best)} pairs")
             
-            # Filter all datasets to only use high-quality interferograms
             intf_sbas = intf_sbas.sel(pair=baseline_pairs_best.pair.values)
             corr_sbas = corr_sbas.sel(pair=baseline_pairs_best.pair.values)
             unwrap_sbas = unwrap_sbas.sel(pair=baseline_pairs_best.pair.values)
             trend_sbas = trend_sbas.sel(pair=baseline_pairs_best.pair.values)
             
-            # Update baseline_pairs to the filtered version
             baseline_pairs = baseline_pairs_best
             
             logger.info("SBAS quality filtering completed")
@@ -424,7 +394,6 @@ class InSARProcessor:
             logger.info("Starting turbulence correction computation")
             
             # First turbulence correction iteration - try without days parameter to avoid timestamp issues
-            # This removes turbulent atmospheric effects that affect all interferograms
             try:
                 turbo_sbas = sbas.regression_pairs(
                     data=unwrap_sbas.phase - trend_sbas, 
@@ -541,7 +510,7 @@ class InSARProcessor:
                 logger.info(f"Displacement data variable: {disp_sbas.name if hasattr(disp_sbas, 'name') else 'unnamed'}")
                 logger.info(f"Displacement dimensions: {disp_sbas.dims}")
             
-            # Force cleanup after displacement computation
+            # Force cleanup aft computation
             gc.collect()
             self._log_memory_usage("after LOS displacement computation")
             
@@ -551,7 +520,6 @@ class InSARProcessor:
             
             logger.info("Starting velocity calculation from displacement time series")
             
-            # Calculate velocity from displacement time series using least-squares trend
             velocity_sbas = sbas.velocity(disp_sbas)
             
             logger.info("Velocity calculation completed")
@@ -572,8 +540,6 @@ class InSARProcessor:
             logger.info("Materializing velocity and displacement data using sync_stack...")
             
             try:
-                # Materialize velocity data (most important for export speed)
-                # sync_stack() is specifically designed for stack-based data like velocity/displacement
                 velocity_sbas = sbas.sync_stack(velocity_sbas, 'velocity_sbas')
                 logger.info("Velocity data materialized successfully with sync_stack")
                 
@@ -600,7 +566,6 @@ class InSARProcessor:
             
             self.update_status(job_id, "processing", "Generating outputs", 95)
             
-            # Generate outputs (including displacement and velocity)
             self._generate_outputs(job_id, sbas, topo, psfunction, baseline_pairs, 
                                  job_results_dir, intf_sbas, corr_sbas, unwrap_sbas, 
                                  trend_sbas, turbo_sbas, turbo2_sbas, disp_sbas, velocity_sbas)
@@ -759,7 +724,6 @@ class InSARProcessor:
                     sbas.export_geotiff(last_displacement, str(displacement_tiff_path.with_suffix('')))
                     logger.info(f"Exported displacement GeoTIFF: {displacement_tiff_path}")
                     
-                    # Restore original scheduler
                     if original_scheduler is not None:
                         import dask
                         dask.config.set(scheduler=original_scheduler)
@@ -783,7 +747,6 @@ class InSARProcessor:
                     for _ in range(3):
                         gc.collect()
             
-            # Export PSF as GeoTIFF (this represents coherence/stability)
             psf_tiff_path = output_dir / "psfunction.tif"
             
             try:
@@ -795,7 +758,6 @@ class InSARProcessor:
                 for _ in range(3):
                     gc.collect()
                 
-                # Temporarily disable Dask for GeoTIFF export to avoid memory issues
                 original_scheduler = None
                 if self.client is not None:
                     import dask
@@ -855,10 +817,8 @@ class InSARProcessor:
             for _ in range(3):
                 gc.collect()
         
-        # Continue with PNG visualizations even if GeoTIFF export failed
         logger.info("Starting PNG visualization generation...")
         
-        # Aggressive memory cleanup before visualization
         import gc
         for _ in range(3):
             gc.collect()
@@ -872,7 +832,6 @@ class InSARProcessor:
             import gc
             gc.collect()
         
-        # Generate displacement visualization
         if disp_sbas is not None:
             displacement_png_path = output_dir / "displacement.png"
             self._plot_displacement(sbas, disp_sbas, displacement_png_path)
@@ -889,11 +848,9 @@ class InSARProcessor:
         import gc
         gc.collect()
         
-        # Generate topography visualization
         topo_png_path = output_dir / "topography.png"
         self._plot_topography(topo, topo_png_path)
         
-        # Force cleanup
         gc.collect()
         
         # Generate baseline plot
@@ -908,7 +865,6 @@ class InSARProcessor:
             # Force cleanup
             gc.collect()
         
-        # Generate correlation visualizations if available  
         if corr_sbas is not None:
             correlation_png_path = output_dir / "correlations.png"
             self._plot_correlations(sbas, corr_sbas, correlation_png_path)
@@ -924,7 +880,6 @@ class InSARProcessor:
             # Force cleanup
             gc.collect()
         
-        # Generate trend correction visualizations if available
         if trend_sbas is not None:
             trend_png_path = output_dir / "trend_phases.png"
             self._plot_trend_phases(sbas, trend_sbas, trend_png_path)
@@ -945,12 +900,10 @@ class InSARProcessor:
             # Force cleanup
             gc.collect()
         
-        # Generate second turbulence correction visualizations if available
         if turbo2_sbas is not None:
             turbo2_png_path = output_dir / "turbulence2_phases.png"
             self._plot_turbulence2_phases(sbas, turbo2_sbas, turbo2_png_path)
             
-            # Generate final corrected phase visualizations (all corrections applied)
             if unwrap_sbas is not None and trend_sbas is not None and turbo_sbas is not None:
                 final_corrected_png_path = output_dir / "final_corrected_phases.png"
                 self._plot_final_corrected_phases(sbas, unwrap_sbas, trend_sbas, turbo_sbas, turbo2_sbas, final_corrected_png_path)
@@ -1532,9 +1485,6 @@ class InSARProcessor:
     Data shape: {unwrap_sbas.phase.shape}
 
     Corrections applied:
-    ✓ Trend correction applied
-    ✓ First turbulence correction applied  
-    ✓ Second turbulence correction applied
 
     Note: Individual final corrected phase plots skipped to avoid 
     memory issues with large datasets"""

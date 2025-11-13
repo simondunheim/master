@@ -1256,7 +1256,7 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          {/* Bottom-right continuous legend */}
+          
           <Legend />
         </div>
       </main>

@@ -12,7 +12,7 @@ services:
       - ./data:/app/data_berlin_A:rw
       - ./results:/app/results:rw
       - ./processing:/app/processing:rw
-      # NEW: Add persistent storage for actual results in /app
+      # persistent storage for actual results in /app
       - ./app_results:/app/app_results:rw
       # Keep work directory persistent for resume capability
       #- ./work:/app/raw_berlin_A:rw

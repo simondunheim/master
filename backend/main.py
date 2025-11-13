@@ -25,11 +25,9 @@ from rasterio.warp import calculate_default_transform, reproject, Resampling
 from rasterio.crs import CRS
 import numpy as np
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# FastAPI app initialization
 app = FastAPI(
     title="Berlin InSAR Processing API - Enhanced with Search & Download",
     description="API for SBAS and PS InSAR analysis with Sentinel-1 burst search and download capabilities",
@@ -46,7 +44,6 @@ app.add_middleware(
     expose_headers=["*"]
 )
 
-# Function to read credentials from config file
 def read_config_file(config_path="config.txt"):
     """Read credentials from config file"""
     config = {}
@@ -64,17 +61,14 @@ def read_config_file(config_path="config.txt"):
         logger.warning(f"Could not read config file: {str(e)}")
         return {}
 
-# Read credentials from config file first, then fall back to environment variables
 config = read_config_file()
 
 # NASA Earthdata Login credentials
 EARTHDATA_USERNAME = config.get("EARTHDATA_USERNAME") or os.environ.get("EARTHDATA_USERNAME", "")
 EARTHDATA_PASSWORD = config.get("EARTHDATA_PASSWORD") or os.environ.get("EARTHDATA_PASSWORD", "")
 
-# Global state for processing jobs
 processing_jobs: Dict[str, Dict] = {}
 
-# Configuration with robust directory handling
 def setup_results_directory():
     """Setup results directory with fallback options"""
     result_dirs = [
@@ -97,7 +91,6 @@ def setup_results_directory():
             logger.warning(f"Cannot use {results_dir}: {e}")
             continue
     
-    # If all fail, use processing directory itself
     logger.warning("Using processing directory for results (no separate results dir)")
     return Path("/app/processing")
 
@@ -107,14 +100,12 @@ RESULTS_DIR = setup_results_directory()
 DOWNLOAD_DIR = Path("./sentinel1_burst_downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-# Store download status
 download_statuses = {}
 
 # ===============================
-# DATA MODELS (ORIGINAL + NEW)
+# DATA MODELS 
 # ===============================
 
-# Original processing models
 class ProcessingRequest(BaseModel):
     analysis_type: str = "complete"  # "sbas", "ps", or "complete"
     email_notification: Optional[str] = None
@@ -181,7 +172,7 @@ class DownloadStatus(BaseModel):
     progress: Optional[float] = None
 
 # ===============================
-# HELPER FUNCTIONS (NEW)
+# HELPER FUNCTIONS 
 # ===============================
 
 def generate_asf_url(request: SearchRequest) -> str:
@@ -192,12 +183,10 @@ def generate_asf_url(request: SearchRequest) -> str:
     center_lon = (request.boundingBox.west + request.boundingBox.east) / 2
     center_lat = (request.boundingBox.south + request.boundingBox.north) / 2
     
-    # Calculate zoom level based on bounding box size
     lon_diff = abs(request.boundingBox.east - request.boundingBox.west)
     lat_diff = abs(request.boundingBox.north - request.boundingBox.south)
     max_diff = max(lon_diff, lat_diff)
     
-    # Rough zoom calculation
     if max_diff > 10:
         zoom = 6
     elif max_diff > 5:
@@ -218,7 +207,6 @@ def generate_asf_url(request: SearchRequest) -> str:
     start_date = f"{request.startDate}T00:00:00Z"
     end_date = f"{request.endDate}T23:59:59Z"
     
-    # Build parameters dictionary - specifically for SENTINEL-1 BURSTS
     params = {
         'zoom': str(zoom),
         'center': f"{center_lon},{center_lat}",
@@ -250,7 +238,6 @@ def generate_asf_url(request: SearchRequest) -> str:
         params['fullBurstIDs'] = request.fullBurstID
         logger.info(f"Adding fullBurstIDs parameter: {request.fullBurstID}")
     
-    # URL encode parameters
     encoded_params = []
     for key, value in params.items():
         encoded_value = urllib.parse.quote(str(value), safe='')
@@ -274,21 +261,17 @@ async def download_file_with_asf(product_id: str):
             download_statuses[product_id].message = f"Required dependencies not installed: {e}"
             return
         
-        # Update status
         download_statuses[product_id].status = "downloading"
         download_statuses[product_id].message = "Setting up ASF downloader..."
         
         if not EARTHDATA_USERNAME or not EARTHDATA_PASSWORD:
             raise Exception("Earthdata credentials not configured")
         
-        # Initialize downloader
         asf_downloader = PyGMTSAR_ASF(EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
         
-        # Prepare download directory
         download_path = str(DOWNLOAD_DIR)
         logger.info(f"Downloading to: {download_path}")
         
-        # Ensure the download directory exists
         os.makedirs(download_path, exist_ok=True)
         
         # Update status
@@ -301,7 +284,6 @@ async def download_file_with_asf(product_id: str):
         # Download the burst
         asf_downloader.download(download_path, [product_id])
         
-        # Check if files were actually downloaded
         files_found = False
         for root, dirs, files in os.walk(download_path):
             if files:
@@ -312,7 +294,6 @@ async def download_file_with_asf(product_id: str):
         if not files_found:
             logger.warning(f"No files found after download for {product_id}")
         
-        # Update status to completed
         download_statuses[product_id].status = "completed"
         download_statuses[product_id].message = f"Download completed to {DOWNLOAD_DIR}"
         download_statuses[product_id].progress = 100.0
@@ -325,7 +306,7 @@ async def download_file_with_asf(product_id: str):
         download_statuses[product_id].message = f"Download failed: {str(e)}"
 
 # ===============================
-# ORIGINAL ENDPOINTS (KEPT EXACTLY AS IS)
+# ORIGINAL ENDPOINTS 
 # ===============================
 
 @app.options("/{full_path:path}")
@@ -431,7 +412,6 @@ async def test_script():
         if not Path(python_exec).exists():
             python_exec = "python3"
         
-        # Try to run the script with --help or just check syntax
         process = await asyncio.create_subprocess_exec(
             python_exec, "-c", f"import py_compile; py_compile.compile('{script_path}', doraise=True)",
             stdout=asyncio.subprocess.PIPE,
@@ -510,7 +490,6 @@ async def start_processing(
         "results": None
     }
     
-    # Start background processing
     background_tasks.add_task(run_insar_processing, job_id, request.analysis_type)
     
     return ProcessingStatus(**processing_jobs[job_id])
@@ -668,7 +647,6 @@ async def get_existing_layers() -> List[MapLayer]:
                 try:
                     logger.info(f"Found existing file: {file_path}")
                     
-                    # Get raster bounds and statistics
                     bounds, color_range, projection = get_raster_info_fixed(str(file_path))
                     
                     layer = MapLayer(
@@ -717,7 +695,6 @@ async def test_file_access(filename: str):
     file_stat = file_path.stat()
     
     try:
-        # Try to read first few bytes to verify file integrity
         with open(file_path, 'rb') as f:
             first_bytes = f.read(1024)
             
@@ -733,13 +710,11 @@ async def test_file_access(filename: str):
     except Exception as e:
         return {"status": "error", "message": f"Cannot read file: {str(e)}"}
 
-# REDIRECT old endpoints to simple endpoints
 @app.get("/api/raster/existing-results/{filename}")
 async def redirect_old_endpoint(filename: str):
     """Redirect old endpoint to simple endpoint"""
     return RedirectResponse(url=f"/api/raster/simple/{filename}", status_code=307)
 
-# SIMPLIFIED file serving - no range requests
 @app.get("/api/raster/simple/{filename}")
 async def serve_simple_raster_file(filename: str):
     """Serve GeoTIFF files without range request support for optimal performance"""
@@ -765,7 +740,6 @@ async def serve_simple_raster_file(filename: str):
         logger.error(f"File not found in any location: {filename}")
         raise HTTPException(status_code=404, detail=f"File not found: {filename}")
     
-    # Enhanced headers for better compatibility
     headers = {
         "Access-Control-Allow-Origin": "*",
         "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
@@ -790,7 +764,6 @@ async def serve_simple_raster_file(filename: str):
 async def get_comparison_plot(job_id: str):
     """Serve comparison plot image"""
     
-    # Handle special case for existing results
     if job_id == "existing-results":
         return await serve_existing_comparison_plot()
     
@@ -817,7 +790,6 @@ async def get_comparison_plot(job_id: str):
 async def serve_existing_comparison_plot():
     """Serve existing comparison plot from various locations"""
     
-    # Search directories for the comparison plot
     search_dirs = [
         Path("/app"),
         Path("/app/app_results"),
@@ -841,7 +813,7 @@ async def serve_existing_comparison_plot():
     raise HTTPException(status_code=404, detail="Comparison plot not found")
 
 # ===============================
-# NEW SEARCH & DOWNLOAD ENDPOINTS
+# SEARCH & DOWNLOAD ENDPOINTS
 # ===============================
 
 @app.post("/search", response_model=SearchResponse)
@@ -863,11 +835,9 @@ async def search_sentinel_data(request: SearchRequest):
         except ImportError:
             raise Exception("asf_search library not found. Please install with: pip install asf_search")
         
-        # Set up ASF session
         session = asf.ASFSession()
         session.auth_with_creds(EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
         
-        # Configure search options for bursts
         opts = {
             'dataset': asf.DATASET.SLC_BURST,
             'start': datetime.strptime(request.startDate, "%Y-%m-%d"),
@@ -882,7 +852,6 @@ async def search_sentinel_data(request: SearchRequest):
                                 f"{bbox.east} {bbox.north}, {bbox.west} {bbox.north}, " \
                                 f"{bbox.west} {bbox.south}))"
         
-        # Add optional parameters
         if request.orbitDirection and request.orbitDirection.lower() != "both":
             opts['flightDirection'] = request.orbitDirection.upper()
             
@@ -929,7 +898,6 @@ async def search_sentinel_data(request: SearchRequest):
                 burst_id = result.properties.get("burstID", "")
                 subswath = result.properties.get("subswath", "")
                 
-                # If subswath is not available, try to extract from fileID
                 if not subswath:
                     file_id = result.properties.get("fileID", "")
                     if "IW1" in file_id:
@@ -939,7 +907,6 @@ async def search_sentinel_data(request: SearchRequest):
                     elif "IW3" in file_id:
                         subswath = "IW3"
                 
-                # Extract burst ID from the file ID if not present
                 if not burst_id:
                     file_id = result.properties.get("fileID", "")
                     parts = file_id.split("_")
@@ -970,16 +937,13 @@ async def search_sentinel_data(request: SearchRequest):
                     except (ValueError, TypeError):
                         burst_index = 1
                 
-                # Alternative: Check if Full Burst ID is available directly
                 api_full_burst_id = result.properties.get("fullBurstID") or result.properties.get("full_burst_id")
                 if api_full_burst_id:
                     full_burst_id = api_full_burst_id
                 
-                # Get scene information
                 scene_name = result.properties.get("sceneName", "")
                 file_id = result.properties.get("fileID", "")
                 
-                # Determine title
                 if burst_id and subswath:
                     title = f"Burst-{subswath}-{burst_id}"
                 elif scene_name:
@@ -1101,7 +1065,6 @@ async def scan_slc():
                     scene_count += 1
                     product_ids.append(item.name)
         
-        # We need at least 2 scenes for InSAR processing
         has_sufficient_data = scene_count >= 2
         
         return {
@@ -1119,7 +1082,7 @@ async def scan_slc():
         }
 
 # ===============================
-# ORIGINAL PROCESSING FUNCTIONS (KEPT EXACTLY AS IS)
+# ORIGINAL PROCESSING FUNCTIONS 
 # ===============================
 
 async def run_insar_processing(job_id: str, analysis_type: str):
@@ -1132,11 +1095,9 @@ async def run_insar_processing(job_id: str, analysis_type: str):
         job["message"] = "Starting InSAR processing..."
         job["progress"] = 5.0
         
-        # Setup processing directory
         processing_dir = Path("/app/processing")
         processing_dir.mkdir(exist_ok=True)
         
-        # Fix permissions on processing directory
         try:
             os.chmod(processing_dir, 0o755)
             test_file = processing_dir / "test_write.tmp"
@@ -1218,7 +1179,6 @@ async def run_insar_processing(job_id: str, analysis_type: str):
                             job["progress"] = time_progress
                             
             except asyncio.TimeoutError:
-                # No output for 10 seconds, continue waiting
                 elapsed = (datetime.now() - job["started_at"]).total_seconds()
                 if elapsed < 3600:  # Keep waiting for up to 1 hour
                     continue
@@ -1226,7 +1186,6 @@ async def run_insar_processing(job_id: str, analysis_type: str):
                     logger.warning(f"Processing timeout after {elapsed/60:.1f} minutes")
                     break
         
-        # Wait for process completion
         returncode = await process.wait()
         
         if returncode == 0:
@@ -1267,7 +1226,6 @@ def collect_result_files_robust(processing_dir: Path) -> Dict[str, str]:
     """Collect all result files with persistent storage backup"""
     result_files = {}
     
-    # Check both processing_dir and /app for result files
     search_dirs = [Path("/app"), processing_dir]
     
     # Persistent storage directory
@@ -1346,13 +1304,10 @@ def get_raster_info_fixed(file_path: str) -> tuple:
             # Validate bounds are finite
             if not all(np.isfinite(bounds)):
                 logger.warning(f"Non-finite bounds detected: {bounds}")
-                # Use default Berlin bounds
                 bounds = [13.35, 52.47, 13.45, 52.57]
                 logger.info(f"Using default Berlin bounds: {bounds}")
             
-            # Read data to get value range
             try:
-                # Read a sample of data to get value range
                 data = src.read(1, masked=True)
                 
                 # Handle masked arrays and NaN values properly
