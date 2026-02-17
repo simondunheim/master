@@ -66,6 +66,7 @@ config = read_config_file()
 # NASA Earthdata Login credentials
 EARTHDATA_USERNAME = config.get("EARTHDATA_USERNAME") or os.environ.get("EARTHDATA_USERNAME", "")
 EARTHDATA_PASSWORD = config.get("EARTHDATA_PASSWORD") or os.environ.get("EARTHDATA_PASSWORD", "")
+EARTHDATA_TOKEN = config.get("EARTHDATA_TOKEN") or os.environ.get("EARTHDATA_TOKEN", "")
 
 processing_jobs: Dict[str, Dict] = {}
 
@@ -820,23 +821,28 @@ async def serve_existing_comparison_plot():
 async def search_sentinel_data(request: SearchRequest):
     """Search for Sentinel-1 SLC burst data"""
     try:
-        if not EARTHDATA_USERNAME or not EARTHDATA_PASSWORD:
-            raise Exception("Earthdata credentials not configured. Please set EARTHDATA_USERNAME and EARTHDATA_PASSWORD.")
-            
+        if not EARTHDATA_TOKEN and (not EARTHDATA_USERNAME or not EARTHDATA_PASSWORD):
+            raise Exception("Earthdata credentials not configured. Please set EARTHDATA_TOKEN or EARTHDATA_USERNAME and EARTHDATA_PASSWORD.")
+
         logger.info(f"Starting burst search with parameters: {request.dict()}")
-        
+
         # Generate ASF URL
         asf_url = generate_asf_url(request)
         logger.info(f"Generated ASF URL: {asf_url}")
-        
+
         # Import required libraries
         try:
             import asf_search as asf
         except ImportError:
             raise Exception("asf_search library not found. Please install with: pip install asf_search")
-        
+
         session = asf.ASFSession()
-        session.auth_with_creds(EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
+        if EARTHDATA_TOKEN:
+            logger.info("Authenticating with Earthdata token")
+            session.auth_with_token(EARTHDATA_TOKEN)
+        else:
+            logger.info("Authenticating with Earthdata username/password")
+            session.auth_with_creds(EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
         
         opts = {
             'dataset': asf.DATASET.SLC_BURST,
