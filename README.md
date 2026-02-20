@@ -101,6 +101,12 @@ In Docker Desktop Settings → Resources, allocate at least **12 GB RAM** and **
 
 ### Step 2: Clone the Repository
 
+Install git on your system:
+https://git-scm.com/install/windows
+
+Varirfy in CMD / terminal:
+git --version
+
 ```bash
 git clone <repository-url>
 cd <project-directory>
