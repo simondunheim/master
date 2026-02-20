@@ -147,6 +147,8 @@ chmod -R 777 data results processing app_results dem_cache
 
 ### Start All Services
 
+Notice: on Windows have DockerDesktop open
+
 ```bash
 docker compose up --build
 ```
