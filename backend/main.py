@@ -9,6 +9,7 @@ import asyncio
 import json
 import uuid
 import urllib.parse
+import zipfile
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from datetime import datetime
@@ -25,8 +26,14 @@ from rasterio.warp import calculate_default_transform, reproject, Resampling
 from rasterio.crs import CRS
 import numpy as np
 
+
+from berlin_insar import InSARProcessor
+processor = InSARProcessor()
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
 
 app = FastAPI(
     title="Berlin InSAR Processing API - Enhanced with Search & Download",
@@ -107,9 +114,19 @@ download_statuses = {}
 # DATA MODELS 
 # ===============================
 
+class BoundingBox(BaseModel):
+    west: float
+    south: float
+    east: float
+    north: float
+
 class ProcessingRequest(BaseModel):
-    analysis_type: str = "complete"  # "sbas", "ps", or "complete"
+    analysis_type: str = "complete"
     email_notification: Optional[str] = None
+    # AOI from user
+    boundingBox: Optional[BoundingBox] = None  # reuses your existing BoundingBox model
+    referenceDate: Optional[str] = None
+    demType: str = "SRTM"
 
 class ProcessingStatus(BaseModel):
     job_id: str
@@ -129,18 +146,12 @@ class MapLayer(BaseModel):
     color_range: List[float]  # [min_value, max_value]
     projection: Optional[str] = None  # CRS identifier
 
-# NEW models for search and download
-class BoundingBox(BaseModel):
-    west: float
-    south: float
-    east: float
-    north: float
 
 class SearchRequest(BaseModel):
     boundingBox: BoundingBox
     startDate: str
     endDate: str
-    productType: str = "SLC"
+    productType: str = "SLC_BURST"
     polarization: Optional[str] = None
     orbitDirection: Optional[str] = None
     path: Optional[int] = None
@@ -172,12 +183,35 @@ class DownloadStatus(BaseModel):
     message: str
     progress: Optional[float] = None
 
+
+def normalize_product_type(product_type: Optional[str]) -> str:
+    """Normalize product type to either SLC_BURST or SLC_SCENE."""
+    normalized = (product_type or "SLC_BURST").strip().upper()
+    if normalized in {"BURST", "BURSTS", "SLC_BURST"}:
+        return "SLC_BURST"
+    if normalized in {"SLC", "SCENE", "SCENES", "SLC_SCENE"}:
+        return "SLC_SCENE"
+    return "SLC_BURST"
+
+
+def extract_slc_archives(download_dir: Path):
+    """Extract SLC zip archives into the download directory if SAFE folders are missing."""
+    zip_files = list(download_dir.glob("S1*_IW_SLC__*.zip"))
+    for zip_path in zip_files:
+        safe_name = zip_path.stem + ".SAFE"
+        safe_path = download_dir / safe_name
+        if safe_path.exists():
+            continue
+        logger.info(f"Extracting SLC archive for scan: {zip_path.name}")
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(download_dir)
+
 # ===============================
 # HELPER FUNCTIONS 
 # ===============================
 
 def generate_asf_url(request: SearchRequest) -> str:
-    """Generate ASF Alaska data search tool URL for burst data based on search parameters"""
+    """Generate ASF Alaska data search tool URL based on selected product type."""
     base_url = "https://search.asf.alaska.edu/#/"
     
     # Calculate center point from bounding box
@@ -208,13 +242,14 @@ def generate_asf_url(request: SearchRequest) -> str:
     start_date = f"{request.startDate}T00:00:00Z"
     end_date = f"{request.endDate}T23:59:59Z"
     
+    requested_mode = normalize_product_type(request.productType)
     params = {
         'zoom': str(zoom),
         'center': f"{center_lon},{center_lat}",
         'polygon': polygon,
         'start': start_date,
         'end': end_date,
-        'dataset': 'SENTINEL-1 BURSTS',
+        'dataset': 'SENTINEL-1 BURSTS' if requested_mode == "SLC_BURST" else 'SENTINEL-1',
         'beamModes': 'IW',
         'resultsLoaded': 'true'
     }
@@ -235,7 +270,7 @@ def generate_asf_url(request: SearchRequest) -> str:
         params['relativeOrbit'] = str(request.path)
         params['path'] = f"{request.path}-"
     
-    if request.fullBurstID:
+    if requested_mode == "SLC_BURST" and request.fullBurstID:
         params['fullBurstIDs'] = request.fullBurstID
         logger.info(f"Adding fullBurstIDs parameter: {request.fullBurstID}")
     
@@ -306,6 +341,56 @@ async def download_file_with_asf(product_id: str):
         download_statuses[product_id].status = "failed"
         download_statuses[product_id].message = f"Download failed: {str(e)}"
 
+async def download_file_by_type(product_id: str, product_type: str):
+    """Download a product by mode: burst workflow or scene workflow."""
+    mode = normalize_product_type(product_type)
+    if mode == "SLC_BURST":
+        await download_file_with_asf(product_id)
+        return
+
+    try:
+        import asf_search as asf
+    except ImportError as e:
+        download_statuses[product_id].status = "failed"
+        download_statuses[product_id].message = f"asf_search not installed: {e}"
+        return
+
+    try:
+        download_statuses[product_id].status = "downloading"
+        download_statuses[product_id].message = "Downloading Sentinel-1 SLC scene..."
+        download_statuses[product_id].progress = 10.0
+
+        session = asf.ASFSession()
+        if EARTHDATA_TOKEN:
+            session.auth_with_token(EARTHDATA_TOKEN)
+        else:
+            session.auth_with_creds(EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
+
+        results = asf.search(granule_list=[product_id])
+        if not results:
+            raise Exception(f"Product not found: {product_id}")
+        results.download(path=str(DOWNLOAD_DIR), session=session, processes=1)
+
+        from pygmtsar import S1
+        extract_slc_archives(DOWNLOAD_DIR)
+        try:
+            scenes = S1.scan_slc(str(DOWNLOAD_DIR))
+        except AssertionError:
+            scenes = None
+        if scenes is None or scenes.empty:
+            raise Exception("Downloaded SLC scene is not scanable by S1.scan_slc")
+
+        S1.download_orbits(str(DOWNLOAD_DIR), scenes)
+
+        download_statuses[product_id].status = "completed"
+        download_statuses[product_id].message = (
+            f"SLC scene download completed and scanable scenes are available in {DOWNLOAD_DIR}"
+        )
+        download_statuses[product_id].progress = 100.0
+    except Exception as e:
+        logger.error(f"Error downloading SLC scene {product_id}: {str(e)}")
+        download_statuses[product_id].status = "failed"
+        download_statuses[product_id].message = f"Download failed: {str(e)}"
 # ===============================
 # ORIGINAL ENDPOINTS 
 # ===============================
@@ -476,10 +561,8 @@ async def start_processing(
     request: ProcessingRequest,
     background_tasks: BackgroundTasks
 ):
-    """Start InSAR processing job"""
     job_id = str(uuid.uuid4())
     
-    # Initialize job status
     processing_jobs[job_id] = {
         "job_id": job_id,
         "status": "queued",
@@ -491,7 +574,12 @@ async def start_processing(
         "results": None
     }
     
-    background_tasks.add_task(run_insar_processing, job_id, request.analysis_type)
+    background_tasks.add_task(
+        run_insar_processing,
+        job_id,
+        request.analysis_type,
+        request.boundingBox  
+    )
     
     return ProcessingStatus(**processing_jobs[job_id])
 
@@ -819,12 +907,13 @@ async def serve_existing_comparison_plot():
 
 @app.post("/search", response_model=SearchResponse)
 async def search_sentinel_data(request: SearchRequest):
-    """Search for Sentinel-1 SLC burst data"""
+    """Search for Sentinel-1 burst or scene data"""
     try:
         if not EARTHDATA_TOKEN and (not EARTHDATA_USERNAME or not EARTHDATA_PASSWORD):
             raise Exception("Earthdata credentials not configured. Please set EARTHDATA_TOKEN or EARTHDATA_USERNAME and EARTHDATA_PASSWORD.")
 
-        logger.info(f"Starting burst search with parameters: {request.dict()}")
+        requested_mode = normalize_product_type(request.productType)
+        logger.info(f"Starting {requested_mode} search with parameters: {request.dict()}")
 
         # Generate ASF URL
         asf_url = generate_asf_url(request)
@@ -844,13 +933,28 @@ async def search_sentinel_data(request: SearchRequest):
             logger.info("Authenticating with Earthdata username/password")
             session.auth_with_creds(EARTHDATA_USERNAME, EARTHDATA_PASSWORD)
         
+        dataset = None
+        if requested_mode == "SLC_BURST":
+            dataset = asf.DATASET.SLC_BURST
+        else:
+            # asf_search dataset constants vary by version; pick the first available scene dataset.
+            for name in ("SLC", "SENTINEL1", "SENTINEL_1", "SENTINEL1_SLC"):
+                candidate = getattr(asf.DATASET, name, None)
+                if candidate is not None:
+                    dataset = candidate
+                    break
+
         opts = {
-            'dataset': asf.DATASET.SLC_BURST,
             'start': datetime.strptime(request.startDate, "%Y-%m-%d"),
             'end': datetime.strptime(request.endDate, "%Y-%m-%d"),
         }
-        
-        logger.info(f"Using dataset: {asf.DATASET.SLC_BURST}")
+        if dataset is not None:
+            opts['dataset'] = dataset
+            logger.info(f"Using dataset: {dataset}")
+        else:
+            logger.warning(
+                "No explicit scene dataset constant found in asf_search; searching without dataset filter for SLC_SCENE mode."
+            )
         
         # Add bounding box
         bbox = request.boundingBox
@@ -867,18 +971,18 @@ async def search_sentinel_data(request: SearchRequest):
         if request.polarization is not None and request.polarization.lower() != "all":
             opts['polarization'] = request.polarization
             
-        if request.subswath is not None:
+        if requested_mode == "SLC_BURST" and request.subswath is not None:
             opts['subswath'] = request.subswath
             
-        if request.burstID is not None:
+        if requested_mode == "SLC_BURST" and request.burstID is not None:
             opts['burstID'] = request.burstID
             
         # Handle Full Burst ID filtering
-        filter_by_full_burst_id = request.fullBurstID is not None
+        filter_by_full_burst_id = requested_mode == "SLC_BURST" and request.fullBurstID is not None
             
         # Perform search
         results = asf.search(**opts)
-        logger.info(f"Found {len(results)} burst results from ASF")
+        logger.info(f"Found {len(results)} results from ASF")
         
         # Format results
         products = []
@@ -992,7 +1096,8 @@ async def search_sentinel_data(request: SearchRequest):
                         "fullBurstID": full_burst_id,
                         "polarization": result.properties.get("polarization", ""),
                         "frame": result.properties.get("frameNumber", None),
-                        "burstIdentifier": file_id.split("_")[-1].split("-")[0] if "-" in file_id else ""
+                        "burstIdentifier": file_id.split("_")[-1].split("-")[0] if "-" in file_id else "",
+                        "productType": requested_mode
                     }
                 )
                 products.append(product)
@@ -1018,26 +1123,32 @@ async def search_sentinel_data(request: SearchRequest):
         )
         
     except Exception as e:
-        logger.error(f"Error in ASF burst search: {str(e)}")
+        logger.error(f"Error in ASF search: {str(e)}")
         raise HTTPException(status_code=503, detail=f"ASF search failed: {str(e)}")
 
 @app.post("/download/{product_id}")
-async def download_product(product_id: str, background_tasks: BackgroundTasks):
-    """Initiate download of a Sentinel-1 burst product"""
+async def download_product(
+    product_id: str,
+    background_tasks: BackgroundTasks,
+    productType: Optional[str] = None
+):
+    """Initiate download of a Sentinel-1 burst or scene product"""
     try:
-        if not EARTHDATA_USERNAME or not EARTHDATA_PASSWORD:
+        if not EARTHDATA_TOKEN and (not EARTHDATA_USERNAME or not EARTHDATA_PASSWORD):
             raise HTTPException(status_code=401, detail="Earthdata credentials not configured")
+
+        requested_mode = normalize_product_type(productType)
         
         # Initialize download status
         download_statuses[product_id] = DownloadStatus(
             productId=product_id,
             status="started",
-            message="Download initiated",
+            message=f"Download initiated ({requested_mode})",
             progress=0.0
         )
         
         # Start download in background
-        background_tasks.add_task(download_file_with_asf, product_id)
+        background_tasks.add_task(download_file_by_type, product_id, requested_mode)
         
         return download_statuses[product_id]
         
@@ -1057,19 +1168,23 @@ async def get_download_status(product_id: str):
 async def scan_slc():
     """Scan for Sentinel-1 SLC data in the download directory"""
     try:
-        # Check for SLC data files
+        from pygmtsar import S1
         scene_count = 0
         product_ids = []
-        
+
         if DOWNLOAD_DIR.exists():
-            # Look for .SAFE directories or .zip files
-            for item in DOWNLOAD_DIR.iterdir():
-                if item.is_dir() and item.name.endswith('.SAFE'):
-                    scene_count += 1
-                    product_ids.append(item.name)
-                elif item.is_file() and item.name.endswith('.zip'):
-                    scene_count += 1
-                    product_ids.append(item.name)
+            extract_slc_archives(DOWNLOAD_DIR)
+            try:
+                scenes = S1.scan_slc(str(DOWNLOAD_DIR))
+            except AssertionError:
+                scenes = None
+
+            if scenes is not None and not scenes.empty:
+                scene_count = len(scenes)
+                if "datapath" in scenes.columns:
+                    product_ids = [Path(p).name for p in scenes["datapath"].tolist()]
+                else:
+                    product_ids = [str(idx) for idx in scenes.index.tolist()]
         
         has_sufficient_data = scene_count >= 2
         
@@ -1091,138 +1206,71 @@ async def scan_slc():
 # ORIGINAL PROCESSING FUNCTIONS 
 # ===============================
 
-async def run_insar_processing(job_id: str, analysis_type: str):
-    """Background task to run InSAR processing"""
+async def run_insar_processing(job_id: str, analysis_type: str, bounding_box: Optional[BoundingBox] = None):
     job = processing_jobs[job_id]
-    
     try:
-        # Update status to running
         job["status"] = "running"
         job["message"] = "Starting InSAR processing..."
         job["progress"] = 5.0
-        
-        processing_dir = Path("/app/processing")
-        processing_dir.mkdir(exist_ok=True)
-        
-        try:
-            os.chmod(processing_dir, 0o755)
-            test_file = processing_dir / "test_write.tmp"
-            test_file.write_text("test")
-            test_file.unlink()
-            logger.info(f"Processing directory permissions verified: {processing_dir}")
-        except Exception as perm_error:
-            logger.warning(f"Could not fix processing directory permissions: {perm_error}")
-            processing_dir = Path("/app")
-        
-        # Full path to script
-        script_path = Path("/app/berlin_insar.py")
-        if not script_path.exists():
-            raise FileNotFoundError(f"InSAR processing script not found at {script_path}")
-        
-        python_exec = "/usr/bin/python3"
-        if not Path(python_exec).exists():
-            python_exec = "python3"
-        
-        # Start the processing
-        job["message"] = "Running SBAS analysis..."
-        job["progress"] = 10.0
-        
-        logger.info(f"Starting InSAR processing: {python_exec} {script_path}")
-        
-        env = dict(os.environ)
-        env['INSAR_LOG_DIR'] = str(processing_dir)
-        
-        process = await asyncio.create_subprocess_exec(
-            python_exec, str(script_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=str(processing_dir),
-            env=env
-        )
-        
-        # Progress tracking keywords
-        progress_map = {
-            "SBAS processing": 20.0,
-            "Starting SBAS analysis": 25.0,
-            "Computing multi-look interferograms": 30.0,
-            "Phase unwrapping": 40.0,
-            "Atmospheric corrections": 45.0,
-            "STARTING PS ANALYSIS": 50.0,
-            "Computing single-look interferograms": 55.0,
-            "PS 1D phase unwrapping": 65.0,
-            "Computing PS displacements": 75.0,
-            "COMPARING SBAS vs PS RESULTS": 85.0,
-            "EXPORTING 3D VISUALIZATION": 92.0,
-            "COMPLETE PROCESSING FINISHED": 100.0
+
+        if bounding_box is None:
+            raise ValueError("No bounding box provided. Please draw an AOI on the map before starting processing.")
+
+        aoi_geojson = json.dumps({
+            "type": "Feature",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [bounding_box.west, bounding_box.south],
+                    [bounding_box.east, bounding_box.south],
+                    [bounding_box.east, bounding_box.north],
+                    [bounding_box.west, bounding_box.north],
+                    [bounding_box.west, bounding_box.south]
+                ]]
+            },
+            "properties": {}
+        })
+
+        parameters = {
+            "orbit": "A",
+            "demType": "SRTM",
+            # Fast mode: skip heavy PNG generation so demo runs finish quickly.
+            "fastOutputs": True
         }
-        
-        # Read output line by line and update progress
-        output_lines = []
-        while True:
-            try:
-                line = await asyncio.wait_for(process.stdout.readline(), timeout=10.0)
-                if not line:
-                    break
-                
-                line_str = line.decode('utf-8', errors='ignore').strip()
-                if line_str:
-                    output_lines.append(line_str)
-                    logger.info(f"Processing: {line_str}")
-                    
-                    # Update progress based on log messages
-                    for keyword, progress in progress_map.items():
-                        if keyword in line_str:
-                            job["progress"] = min(progress, 99.0)
-                            job["message"] = f"Processing: {keyword}"
-                            logger.info(f"Progress updated: {progress}% - {keyword}")
-                            break
-                    
-                    # Update generic progress based on time elapsed
-                    elapsed = (datetime.now() - job["started_at"]).total_seconds()
-                    if elapsed > 300:  # After 5 minutes, gradually increase
-                        time_progress = min(30 + (elapsed - 300) / 60, 95)
-                        if job["progress"] < time_progress:
-                            job["progress"] = time_progress
-                            
-            except asyncio.TimeoutError:
-                elapsed = (datetime.now() - job["started_at"]).total_seconds()
-                if elapsed < 3600:  # Keep waiting for up to 1 hour
-                    continue
-                else:
-                    logger.warning(f"Processing timeout after {elapsed/60:.1f} minutes")
-                    break
-        
-        returncode = await process.wait()
-        
-        if returncode == 0:
-            # Processing completed successfully
-            job["status"] = "completed"
-            job["progress"] = 100.0  
-            job["message"] = "Processing completed successfully"
-            job["completed_at"] = datetime.now()
-            
-            # Collect result files from wherever they actually are
-            result_files = collect_result_files_robust(processing_dir)
-            
-            # Generate statistics
-            stats = generate_processing_statistics(result_files)
-            
-            job["results"] = {
-                "files": result_files,
-                "statistics": stats,
-                "processing_time": (job["completed_at"] - job["started_at"]).total_seconds() / 60,
-                "output_log": output_lines[-50:] if len(output_lines) > 50 else output_lines
-            }
-            
-            logger.info(f"Processing completed successfully for job {job_id}")
-            
-        else:
-            # Processing failed
-            error_output = "\n".join(output_lines[-10:]) if output_lines else "No output captured"
-            job["status"] = "failed"
-            job["message"] = f"Processing failed with return code {returncode}"
-            logger.error(f"Processing failed for job {job_id}: {error_output}")
-            
+
+        processing_task = asyncio.create_task(
+            asyncio.to_thread(
+                processor.process_insar,
+                job_id,
+                aoi_geojson,
+                parameters
+            )
+        )
+
+        # Bridge processor internal status updates to API job status in real time.
+        while not processing_task.done():
+            proc_status = processor.get_status(job_id)
+            if proc_status and proc_status.get("status") != "not_found":
+                job["status"] = "running" if proc_status.get("status") == "processing" else proc_status.get("status", "running")
+                job["message"] = proc_status.get("message", job["message"])
+                job["progress"] = float(proc_status.get("progress", job["progress"]))
+            await asyncio.sleep(2)
+
+        # Propagate processing exceptions, if any.
+        await processing_task
+
+        proc_status = processor.get_status(job_id)
+        job["status"] = proc_status.get("status", "completed")
+        job["message"] = proc_status.get("message", "Done")
+        job["progress"] = proc_status.get("progress", 100.0)
+        job["completed_at"] = datetime.now()
+        job["results"] = {
+            "files": {},
+            "statistics": {},
+            "processing_time": (job["completed_at"] - job["started_at"]).total_seconds() / 60,
+            "results": proc_status.get("results", {})
+        }
+
     except Exception as e:
         job["status"] = "failed"
         job["message"] = f"Processing error: {str(e)}"
@@ -1414,10 +1462,10 @@ def generate_processing_statistics(result_files: Dict[str, str]) -> Dict:
 if __name__ == "__main__":
     # Print credentials status on startup
     if EARTHDATA_USERNAME and EARTHDATA_PASSWORD:
-        print(f"✓ Earthdata credentials found for user: {EARTHDATA_USERNAME}")
-        print(f"✓ Source: {'Config file' if EARTHDATA_USERNAME in config else 'Environment variables'}")
+        print(f" Earthdata credentials found for user: {EARTHDATA_USERNAME}")
+        print(f" Source: {'Config file' if EARTHDATA_USERNAME in config else 'Environment variables'}")
     else:
-        print("✗ Earthdata credentials not found!")
+        print(" Earthdata credentials not found!")
         print("To use ASF API, set credentials in config.txt or environment variables:")
         print("Option 1: Create a config.txt file with:")
         print("EARTHDATA_USERNAME=your_username")
