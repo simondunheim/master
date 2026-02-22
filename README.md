@@ -98,7 +98,7 @@ In Docker Desktop Settings → Resources, allocate at least **12 GB RAM** and **
 2. Install Docker Desktop with WSL2 backend enabled
 3. In Docker Desktop Settings → Resources → WSL Integration, enable your Linux distribution
 4. Allocate at least **12 GB RAM** in Docker Desktop Settings → Resources
-
+5. Note. Docker Desktop must be running to use Docker commands in WSL2
 ### Step 2: Clone the Repository
 
 Install git on your system:
